@@ -88,4 +88,46 @@ menu "KernSigner Configuration"
         help
             Optional PN5180 IRQ GPIO. Use -1 when IRQ is not connected.
 
+    config KSIG_SEC1210_ENABLED
+        bool "Enable SEC1210 UART smart card reader"
+        default n
+        help
+            Enable the Microchip SEC1210 Smart Card 2 Click driver for
+            ISO7816 smart cards over UART using CCID protocol.
+
+            This driver implements the CCID-over-UART protocol used by
+            the SEC1210 chip, as documented in the Linux CCID driver's
+            ccid_serial.c and MikroElektronika Smart Card 2 Click library.
+
+    config KSIG_SEC1210_UART_NUM
+        int "SEC1210 UART peripheral number"
+        range 0 3
+        default 2
+        depends on KSIG_SEC1210_ENABLED
+        help
+            ESP-IDF UART peripheral to use for SEC1210 communication.
+
+    config KSIG_SEC1210_UART_TX_PIN
+        int "SEC1210 UART TX GPIO pin"
+        default 17
+        depends on KSIG_SEC1210_ENABLED
+        help
+            GPIO pin connected to the SEC1210 RX line (UART TX from ESP32).
+
+    config KSIG_SEC1210_UART_RX_PIN
+        int "SEC1210 UART RX GPIO pin"
+        default 16
+        depends on KSIG_SEC1210_ENABLED
+        help
+            GPIO pin connected to the SEC1210 TX line (UART RX to ESP32).
+
+    config KSIG_SEC1210_UART_BAUDRATE
+        int "SEC1210 UART baudrate"
+        range 9600 460800
+        default 115200
+        depends on KSIG_SEC1210_ENABLED
+        help
+            Baud rate for SEC1210 UART communication. Default is 115200
+            as used by the Smart Card 2 Click board.
+
 endmenu

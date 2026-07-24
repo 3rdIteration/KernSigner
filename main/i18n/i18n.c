@@ -5188,7 +5188,7 @@ static const char *const I18N_MESSAGES[I18N_MESSAGE_COUNT][I18N_LANG_COUNT] = {
         [I18N_LANG_ZH_HANS_CN] = "PIN 码设置",
     },
     {
-        [I18N_LANG_EN] = "Setup PIN",
+        [I18N_LANG_EN] = "Device PIN",
         [I18N_LANG_CA] = "Configura PIN",
         [I18N_LANG_CS] = "Nastavit PIN",
         [I18N_LANG_DE] = "PIN einrichten",

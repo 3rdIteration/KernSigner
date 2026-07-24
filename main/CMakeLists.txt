@@ -30,6 +30,7 @@ set(SOURCES
     "smartcard/smartcard_pn5180.c"
     "smartcard/smartcard_satochip.c"
     "smartcard/smartcard_transport.c"
+$<$<BOOL:${CONFIG_KSIG_SEC1210_ENABLED}>:smartcard/smartcard_sec1210.c>
     "ui/battery.c"
     "ui/dialog.c"
     "ui/font_policy.c"

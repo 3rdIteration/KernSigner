@@ -993,7 +993,7 @@ static void transition_to(pin_flow_state_t state) {
     build_unlock_entry_state();
     break;
   case STATE_SETUP_FULL_PIN:
-    build_entry_state(i18n_tr_or("pin.setup", "Setup PIN"));
+    build_entry_state(i18n_tr_or("pin.setup", "Device PIN"));
     break;
   case STATE_SETUP_CONFIRM_PIN:
     build_entry_state(i18n_tr_or("pin.confirm", "Confirm PIN"));

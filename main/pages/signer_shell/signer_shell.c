@@ -612,8 +612,8 @@ static const signer_menu_override_t SIGNER_SMARTCARD_MAINT_MENU[] = {
     {"Change PIN", "smartcard_satochip_change_pin"},
     {"Unlock", "smartcard_satochip_unblock_pin"},
     {"Change Label", "smartcard_satochip_set_label"},
-    {"NFC策略", "smartcard_satochip_nfc_policy"},
-    {"功能策略", "smartcard_satochip_feature_policy"},
+    {"NFC Policy", "smartcard_satochip_nfc_policy"},
+    {"Feature Policy", "smartcard_satochip_feature_policy"},
     {"Reset", "smartcard_satochip_reset_seed"},
     {"Factory", "smartcard_satochip_reset_factory"},
     {"Authenticity", "smartcard_satochip_authenticity"},
@@ -645,7 +645,7 @@ static const signer_menu_override_t SIGNER_SMARTCARD_SEEDKEEPER_MENU[] = {
     {"Status", "smartcard_seedkeeper_status_page"},
     {"Setup PIN", "smartcard_seedkeeper_setup_pin"},
     {"Change PIN", "smartcard_seedkeeper_change_pin"},
-    {"清空SeedKeeper", "smartcard_seedkeeper_reset"},
+    {"Wipe SeedKeeper", "smartcard_seedkeeper_reset"},
     {"Free Space", "smartcard_seedkeeper_free_space"},
     {"List", "smartcard_seedkeeper_list_page"},
     {"Create", "smartcard_seedkeeper_create_mnemonic"},
@@ -663,7 +663,7 @@ static const signer_menu_override_t SIGNER_SMARTCARD_SEEDKEEPER_ADVANCED_MENU[] 
     {"Masterseed", "smartcard_seedkeeper_generate_masterseed"},
     {"2FA", "smartcard_seedkeeper_generate_2fa_secret"},
     {"Derive Password", "smartcard_seedkeeper_derive_master_password"},
-    {"删除条目", "smartcard_seedkeeper_reset_secret"},
+    {"Delete Item", "smartcard_seedkeeper_reset_secret"},
 };
 
 static const signer_menu_override_t SIGNER_SMARTCARD_CERTIFICATE_MENU[] = {
@@ -726,7 +726,7 @@ static const signer_feature_t SIGNER_LOCAL_SMARTCARD_FEATURES[] = {
      "main/pages/signer_shell/signer_shell.c", SIGNER_FEATURE_ACTION,
      SIGNER_FEATURE_UI_READY, SIGNER_FEATURE_RISK_SECRET_MATERIAL},
     {"smartcard_seedkeeper_reset_secret",
-     "smartcard_seedkeeper_advanced_tools", "删除条目", "按SID删除",
+     "smartcard_seedkeeper_advanced_tools", "Delete Item", "Delete by SID",
      "Delete a specific item on the card.",
      "main/pages/signer_shell/signer_shell.c", SIGNER_FEATURE_ACTION,
      SIGNER_FEATURE_UI_READY, SIGNER_FEATURE_RISK_SECRET_MATERIAL},
@@ -776,7 +776,7 @@ static const signer_feature_t SIGNER_LOCAL_SMARTCARD_FEATURES[] = {
      "main/pages/signer_shell/signer_shell.c", SIGNER_FEATURE_ACTION,
      SIGNER_FEATURE_UI_READY, SIGNER_FEATURE_RISK_SECRET_MATERIAL},
     {"smartcard_seedkeeper_reset",
-     "smartcard_satochip_seedkeeper_tools", "清空SeedKeeper", "整卡清空",
+     "smartcard_satochip_seedkeeper_tools", "Wipe SeedKeeper", "Whole card wipe",
      "Wipe SeedKeeper and return it to an uninitialized state.",
      "main/pages/signer_shell/signer_shell.c", SIGNER_FEATURE_ACTION,
      SIGNER_FEATURE_UI_READY, SIGNER_FEATURE_RISK_SECRET_MATERIAL},
@@ -828,12 +828,12 @@ static const signer_feature_t SIGNER_LOCAL_SMARTCARD_FEATURES[] = {
      "Change card label", "Write the card label.", "main/pages/signer_shell/signer_shell.c",
      SIGNER_FEATURE_ACTION, SIGNER_FEATURE_UI_READY,
      SIGNER_FEATURE_RISK_SECRET_MATERIAL},
-    {"smartcard_satochip_nfc_policy", "smartcard_satochip_maint", "NFC策略",
-     "NFC开关", "Write the NFC policy value.", "main/pages/signer_shell/signer_shell.c",
+    {"smartcard_satochip_nfc_policy", "smartcard_satochip_maint", "NFC Policy",
+     "NFC Toggle", "Write the NFC policy value.", "main/pages/signer_shell/signer_shell.c",
      SIGNER_FEATURE_ACTION, SIGNER_FEATURE_UI_READY,
      SIGNER_FEATURE_RISK_SECRET_MATERIAL},
     {"smartcard_satochip_feature_policy", "smartcard_satochip_maint",
-     "功能策略", "功能开关", "Write the Schnorr / Nostr / Liquid policy.",
+     "Feature Policy", "Feature Toggle", "Write the Schnorr / Nostr / Liquid policy.",
      "main/pages/signer_shell/signer_shell.c", SIGNER_FEATURE_ACTION,
      SIGNER_FEATURE_UI_READY, SIGNER_FEATURE_RISK_SECRET_MATERIAL},
     {"smartcard_satochip_reset_seed", "smartcard_satochip_maint", "Reset",
@@ -6747,9 +6747,9 @@ satochip_seedkeeper_stub_title(satochip_maint_mode_t mode) {
   case SATOCHIP_MAINT_SEEDKEEPER_RESET:
   case SATOCHIP_MAINT_SEEDKEEPER_RESET_PIN_STEP:
   case SATOCHIP_MAINT_SEEDKEEPER_RESET_PUK_STEP:
-    return "清空SeedKeeper";
+    return "Wipe SeedKeeper";
   case SATOCHIP_MAINT_SEEDKEEPER_RESET_SECRET:
-    return "删除条目";
+    return "Delete Item";
   case SATOCHIP_MAINT_SEEDKEEPER_GENERATE_MASTERSEED:
     return "Masterseed";
   case SATOCHIP_MAINT_SEEDKEEPER_GENERATE_2FA_SECRET:
@@ -8443,7 +8443,7 @@ static void create_satochip_seedkeeper_reset_block(
   satochip_maint_prepare(SATOCHIP_MAINT_SEEDKEEPER_RESET);
   lv_obj_t *panel =
       create_panel(parent, error_color(), max_i(14, theme_get_small_padding()));
-  create_text(panel, feature ? shell_feature_title(feature) : "清空SeedKeeper", true,
+  create_text(panel, feature ? shell_feature_title(feature) : "Wipe SeedKeeper", true,
               error_color());
   create_text(panel, "Newer SeedKeeper cards must lock PIN first, then PUK.", false,
               main_color());
@@ -8492,7 +8492,7 @@ static void create_satochip_nfc_policy_block(lv_obj_t *parent,
   satochip_maint_prepare(SATOCHIP_MAINT_NFC_POLICY);
   lv_obj_t *panel =
       create_panel(parent, highlight_color(), max_i(14, theme_get_small_padding()));
-  create_text(panel, feature ? shell_feature_title(feature) : "NFC策略", true,
+  create_text(panel, feature ? shell_feature_title(feature) : "NFC Policy", true,
               main_color());
   satochip_maint_attach_primary_input(panel, "PIN", true, false, 64, "");
   satochip_maint_attach_extra_field(panel, "Policy", "0 enable 1 disable 2 block forever",
@@ -8506,7 +8506,7 @@ static void create_satochip_feature_policy_block(lv_obj_t *parent,
   satochip_maint_prepare(SATOCHIP_MAINT_FEATURE_POLICY);
   lv_obj_t *panel =
       create_panel(parent, highlight_color(), max_i(14, theme_get_small_padding()));
-  create_text(panel, feature ? shell_feature_title(feature) : "功能策略", true,
+  create_text(panel, feature ? shell_feature_title(feature) : "Feature Policy", true,
               main_color());
   satochip_maint_attach_primary_input(panel, "PIN", true, false, 64, "");
   satochip_maint_attach_extra_field(panel, "Feature ID", "0 sign 1 Nostr 2 Liquid", "0", false,
