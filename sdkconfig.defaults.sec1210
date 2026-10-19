@@ -10,7 +10,7 @@
 #
 # It disables the PN5180 NFC reader (the wave_43 default leaves it enabled for
 # other builds) and enables the SEC1210 serial CCID reader. The board's 40-pin
-# header routes the hat's UART to GPIO2 (TX, to the reader's RXD) and GPIO5
+# header routes the hat's UART to GPIO21 (TX, to the reader's RXD) and GPIO28
 # (RX, from the reader's TXD). Do NOT use GPIO37/GPIO38: those are the console
 # U0TXD/U0RXD, shared with the USB-to-UART bridge and are boot strapping pins.
 
@@ -18,6 +18,6 @@ CONFIG_KSIG_BOARD_WAVE_43=y
 # CONFIG_KSIG_PN5180_ENABLED is not set
 CONFIG_KSIG_SEC1210_ENABLED=y
 CONFIG_KSIG_SEC1210_UART_NUM=2
-CONFIG_KSIG_SEC1210_UART_TX_PIN=2
-CONFIG_KSIG_SEC1210_UART_RX_PIN=5
+CONFIG_KSIG_SEC1210_UART_TX_PIN=21
+CONFIG_KSIG_SEC1210_UART_RX_PIN=28
 CONFIG_KSIG_SEC1210_UART_BAUDRATE=115200

@@ -169,14 +169,6 @@ static size_t ccid_build_t1_block(uint8_t *out, uint8_t pcb,
     return 4 + inf_len;
 }
 
-static size_t ccid_build_t1_i_block(uint8_t *out, uint8_t host_ns,
-                                    const uint8_t *apdu, size_t apdu_len) {
-    if (!out || !apdu || apdu_len > SMARTCARD_SEC1210_T1_MAX_INF_LEN)
-        return 0;
-    uint8_t pcb = (host_ns & 0x01U) ? 0x40 : 0x00;
-    return ccid_build_t1_block(out, pcb, apdu, apdu_len);
-}
-
 static size_t ccid_build_t1_r_block(uint8_t *out, uint8_t nr) {
     if (!out)
         return 0;
@@ -236,9 +228,8 @@ typedef struct {
     uint32_t dw_default_clock;
     uint32_t dw_max_data_rate;
 
-    /* RX diagnostics. UART2 takes GPIO37 from the console in the GPIO matrix,
-     * so ESP_LOG is unreliable during a probe; these are shown on screen to
-     * distinguish "reader silent" from "reader replying but misparsed". */
+    /* RX diagnostics, shown on screen to distinguish "reader silent" from
+     * "reader replying but misparsed". */
     uint32_t rx_bytes_total;
     uint8_t rx_first[16];
     uint8_t rx_first_len;
@@ -535,11 +526,6 @@ static void parse_atr_t_params(sec1210_ctx_t *ctx, const uint8_t *atr,
         if (y == 0) break;
     }
 
-    /* If T=1 is the first protocol, TA1 should contain IFSC info */
-    if (ctx->atr_t1_present && ctx->atr_ta1 != 0x11) {
-        ctx->atr_t1_ifsc = ctx->atr_ta1;
-    }
-
     ESP_LOGI(TAG, "ATR parsed: T=1=%s, TA1=0x%02X, TC1=0x%02X, IFSC=%u",
              ctx->atr_t1_present ? "yes" : "no",
              ctx->atr_ta1, ctx->atr_tc1, ctx->atr_t1_ifsc);
@@ -573,6 +559,49 @@ static bool parse_ccid_status(const uint8_t *resp, size_t len, uint8_t *status,
     if (error)
         *error = resp[SMARTCARD_SEC1210_CCID_OFF_ERROR];
     return true;
+}
+
+/* CCID bError names (CCID rev 1.1, section 6.2.6), for bring-up logs. */
+static const char *ccid_error_name(uint8_t error) {
+    switch (error) {
+    case 0xFF: return "CMD_ABORTED";
+    case 0xFE: return "ICC_MUTE";
+    case 0xFD: return "XFR_PARITY_ERROR";
+    case 0xFC: return "XFR_OVERRUN";
+    case 0xFB: return "HW_ERROR";
+    case 0xF8: return "BAD_ATR_TS";
+    case 0xF7: return "BAD_ATR_TCK";
+    case 0xF6: return "ICC_PROTOCOL_NOT_SUPPORTED";
+    case 0xF5: return "ICC_CLASS_NOT_SUPPORTED";
+    case 0xF4: return "PROCEDURE_BYTE_CONFLICT";
+    case 0xF3: return "DEACTIVATED_PROTOCOL";
+    case 0xF2: return "BUSY_WITH_AUTO_SEQUENCE";
+    case 0xE0: return "CMD_SLOT_BUSY";
+    case 0x00: return "CMD_NOT_SUPPORTED";
+    default: return "unknown";
+    }
+}
+
+/* bmICCStatus, bits 0-1 of bStatus */
+static const char *ccid_icc_status_name(uint8_t status) {
+    switch (status & 0x03U) {
+    case 0x00: return "active";
+    case 0x01: return "present, inactive";
+    case 0x02: return "not present";
+    default: return "RFU";
+    }
+}
+
+/* Hex-dump a received CCID frame to the console. */
+static void sec1210_log_frame(const char *what, const uint8_t *frame,
+                              size_t len) {
+    char hex[3 * 32 + 1];
+    size_t pos = 0;
+    for (size_t i = 0; i < len && i < 32; i++)
+        pos += (size_t)snprintf(hex + pos, sizeof(hex) - pos, "%02X ", frame[i]);
+    hex[pos] = '\0';
+    ESP_LOGI(TAG, "%s (%u bytes): %s%s", what, (unsigned)len, hex,
+             len > 32 ? "..." : "");
 }
 
 /* Extract ATR from RDR_IccPowerOn response */
@@ -628,109 +657,151 @@ static esp_err_t extract_apdu_response(const uint8_t *resp, size_t resp_len,
     return ESP_OK;
 }
 
-/* Transmit APDU using T=1 protocol */
+/* Send one T=1 block in an XfrBlock and return the card's reply block. At
+ * TPDU level the reader passes blocks through untouched. A WTX request
+ * (S-block 0xC3) is answered here, so callers only see I- and R-blocks and
+ * the S-blocks this does not handle. */
+static esp_err_t t1_exchange_block(sec1210_ctx_t *ctx, const uint8_t *blk,
+                                   size_t blk_len, uint8_t *rblk,
+                                   size_t rblk_cap, size_t *rblk_len) {
+    uint8_t cmd[SMARTCARD_SEC1210_CCID_MSG_MIN_LEN + SMARTCARD_SEC1210_T1_MAX_INF_LEN + 4];
+    uint8_t resp[SMARTCARD_SEC1210_RESPONSE_MAX_LEN];
+    uint8_t wtx[5]; /* NAD PCB LEN INF LRC */
+    size_t resp_len = 0;
+
+    for (int wtx_count = 0; wtx_count < 16; wtx_count++) {
+        size_t cmd_len = build_xfr_block(cmd, 0, ctx->seq++, blk, blk_len);
+        esp_err_t err = sec1210_send_receive(ctx, cmd, cmd_len, resp,
+                                             sizeof(resp), &resp_len);
+        if (err != ESP_OK)
+            return err;
+
+        uint8_t status = 0, error = 0;
+        if (!parse_ccid_status(resp, resp_len, &status, &error))
+            return ESP_ERR_INVALID_RESPONSE;
+        if (status & 0x40U) {
+            ESP_LOGW(TAG, "XfrBlock failed: bStatus=0x%02X bError=0x%02X (%s)",
+                     status, error, ccid_error_name(error));
+            return ESP_FAIL;
+        }
+
+        uint32_t data_len = read_le32(resp + 1);
+        if (data_len < 4 || data_len > resp_len - SMARTCARD_SEC1210_CCID_HEADER_SIZE ||
+            data_len > rblk_cap)
+            return ESP_ERR_INVALID_RESPONSE;
+        const uint8_t *r = resp + SMARTCARD_SEC1210_CCID_HEADER_SIZE;
+        if ((size_t)r[2] + 4 != data_len || ccid_t1_lrc(r, data_len) != 0) {
+            ESP_LOGW(TAG, "Bad T=1 block from card");
+            sec1210_log_frame("  block", r, data_len);
+            return ESP_ERR_INVALID_CRC;
+        }
+
+        if (r[1] != 0xC3) { /* not S(WTX request) */
+            memcpy(rblk, r, data_len);
+            *rblk_len = data_len;
+            return ESP_OK;
+        }
+
+        /* S(WTX response) echoes the multiplier, then resend nothing: the
+         * card's reply to the original block follows. */
+        ESP_LOGD(TAG, "T=1 WTX x%u", r[3]);
+        blk_len = ccid_build_t1_block(wtx, 0xE3, &r[3], 1);
+        blk = wtx;
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+/* Transmit APDU using T=1 (ISO 7816-3 section 11) over a TPDU-level reader:
+ * the host builds the blocks. N(S) for both sides persists across APDUs and
+ * is reset at power-on. Handles send and receive chaining, IFS requests and
+ * card R-blocks asking for retransmission. */
 static esp_err_t transmit_apdu_t1(sec1210_ctx_t *ctx, const uint8_t *apdu,
                                    size_t apdu_len, uint8_t *response,
                                    size_t response_cap, size_t *response_len,
                                    uint16_t *sw) {
-    uint8_t buf[SMARTCARD_SEC1210_CCID_MSG_MIN_LEN + SMARTCARD_SEC1210_T1_MAX_INF_LEN];
-    uint8_t resp[SMARTCARD_SEC1210_RESPONSE_MAX_LEN];
-    size_t resp_len;
+    uint8_t blk[SMARTCARD_SEC1210_T1_MAX_INF_LEN + 4];
+    uint8_t rblk[SMARTCARD_SEC1210_T1_MAX_INF_LEN + 4];
+    size_t blk_len, rblk_len = 0;
+    size_t ifsc = ctx->atr_t1_ifsc ? ctx->atr_t1_ifsc : SMARTCARD_SEC1210_ATR_T1_IFSC_DEFAULT;
+    size_t off = 0, out_len = 0;
+    int retries = 0;
     esp_err_t err;
 
-    ctx->t1.host_ns = 0;
-    ctx->t1.expected_card_ns = 0;
-    ctx->t1.exchange_steps = 0;
-    ctx->t1.response_len = 0;
+    if (!apdu || !response)
+        return ESP_ERR_INVALID_ARG;
+    if (ifsc > SMARTCARD_SEC1210_T1_MAX_INF_LEN)
+        ifsc = SMARTCARD_SEC1210_T1_MAX_INF_LEN;
 
-    /* Build T=1 I-block from APDU */
-    size_t i_block_len = ccid_build_t1_i_block(buf + SMARTCARD_SEC1210_CCID_MSG_MIN_LEN,
-                                                ctx->t1.host_ns, apdu, apdu_len);
-    if (i_block_len == 0) return ESP_ERR_NO_MEM;
+    /* Send phase: I-blocks, chained when the APDU exceeds IFSC. */
+    for (;;) {
+        size_t chunk = apdu_len - off;
+        if (chunk > ifsc)
+            chunk = ifsc;
+        bool more = off + chunk < apdu_len;
+        uint8_t pcb = (uint8_t)((ctx->t1.host_ns << 6) | (more ? 0x20 : 0x00));
+        blk_len = ccid_build_t1_block(blk, pcb, apdu + off, chunk);
 
-    /* Wrap in CCID XfrBlock command */
-    size_t cmd_len = build_xfr_block(buf, 0, ctx->seq++, buf + SMARTCARD_SEC1210_CCID_MSG_MIN_LEN,
-                                      i_block_len);
+        err = t1_exchange_block(ctx, blk, blk_len, rblk, sizeof(rblk), &rblk_len);
+        if (err != ESP_OK)
+            return err;
 
-    /* Send and receive */
-    err = sec1210_send_receive(ctx, buf, cmd_len, resp, sizeof(resp), &resp_len);
-    if (err != ESP_OK) return err;
+        if (t1_is_r_block(rblk[1]) &&
+            ((rblk[1] >> 4) & 0x01U) == ctx->t1.host_ns) {
+            /* Card asks for our block again */
+            if (++retries > 3)
+                return ESP_ERR_INVALID_RESPONSE;
+            continue;
+        }
+        ctx->t1.host_ns ^= 1;
+        if (!more)
+            break;
+        if (!t1_is_r_block(rblk[1])) {
+            ESP_LOGW(TAG, "T=1: expected R-block in chain, got PCB=0x%02X", rblk[1]);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        off += chunk;
+        retries = 0;
+    }
 
-    /* Parse response */
-    uint8_t status, error;
-    if (!parse_ccid_status(resp, resp_len, &status, &error))
+    /* Receive phase: collect I-blocks, acknowledging chained ones. */
+    for (;;) {
+        uint8_t rpcb = rblk[1];
+        if (t1_is_i_block(rpcb)) {
+            size_t inf_len = rblk[2];
+            if (t1_i_ns(rpcb) != ctx->t1.expected_card_ns)
+                ESP_LOGW(TAG, "T=1: unexpected card N(S)=%u", t1_i_ns(rpcb));
+            ctx->t1.expected_card_ns = t1_i_ns(rpcb) ^ 1U;
+            if (out_len + inf_len > response_cap)
+                return ESP_ERR_NO_MEM;
+            memcpy(response + out_len, &rblk[3], inf_len);
+            out_len += inf_len;
+            if ((rpcb & 0x20U) == 0)
+                break;
+            blk_len = ccid_build_t1_r_block(blk, ctx->t1.expected_card_ns);
+        } else if ((rpcb & 0xC0U) == 0xC0U && (rpcb & 0x3FU) == 0x01U) {
+            /* S(IFS request): accept the card's new IFSC */
+            ifsc = rblk[3];
+            blk_len = ccid_build_t1_block(blk, 0xE1, &rblk[3], 1);
+        } else if (t1_is_r_block(rpcb)) {
+            /* Card did not get our last block: blk still holds it */
+            if (++retries > 3)
+                return ESP_ERR_INVALID_RESPONSE;
+        } else {
+            ESP_LOGW(TAG, "T=1: unexpected block PCB=0x%02X", rpcb);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+
+        err = t1_exchange_block(ctx, blk, blk_len, rblk, sizeof(rblk), &rblk_len);
+        if (err != ESP_OK)
+            return err;
+    }
+
+    if (out_len < 2)
         return ESP_ERR_INVALID_RESPONSE;
-
-    if (status == 0x02) { /* TIME_EXTENSION */
-        /* Card wants more time - send WTX response */
-        uint8_t wtx_cmd[SMARTCARD_SEC1210_CCID_MSG_MIN_LEN + 1];
-        size_t wtx_len = build_xfr_block(wtx_cmd, 0, ctx->seq++, NULL, 1);
-        wtx_cmd[SMARTCARD_SEC1210_CCID_MSG_MIN_LEN] = 0xE3; /* S-Block WTX */
-
-        err = sec1210_send_receive(ctx, wtx_cmd, wtx_len, resp, sizeof(resp), &resp_len);
-        if (err != ESP_OK) return err;
-    }
-
-    if (status != 0x00 && status != 0x01) /* not PROCESSED or EXTENSION */
-        return ESP_FAIL;
-
-    /* Parse T=1 response: extract I-block data */
-    if (resp_len < SMARTCARD_SEC1210_CCID_HEADER_SIZE + 4)
-        return ESP_ERR_INVALID_RESPONSE;
-
-    uint32_t data_len = read_le32(resp + 1);
-    if (data_len < 4 || data_len > resp_len - SMARTCARD_SEC1210_CCID_HEADER_SIZE)
-        return ESP_ERR_INVALID_RESPONSE;
-
-    /* T=1 block: NAD(1) + PCB(1) + LEN(1) + INF(N) + CRC(1) */
-    const uint8_t *t1_block = resp + SMARTCARD_SEC1210_CCID_HEADER_SIZE;
-    if (data_len < 4) return ESP_ERR_INVALID_RESPONSE;
-
-    uint8_t pcb = t1_block[1];
-    if (!t1_is_i_block(pcb)) {
-        /* Not an I-block - could be R-block or S-block */
-        ESP_LOGW(TAG, "Expected I-block, got PCB=0x%02X", pcb);
-        /* Try to extract anyway */
-        return extract_apdu_response(resp, resp_len, response, response_cap,
-                                      response_len, sw);
-    }
-
-    uint8_t inf_len = t1_block[2];
-    if (inf_len + 4 > data_len) {
-        ESP_LOGE(TAG, "T=1 INF length mismatch: %u vs %lu",
-                 inf_len, (unsigned long)data_len);
-        return extract_apdu_response(resp, resp_len, response, response_cap,
-                                      response_len, sw);
-    }
-
-    /* Update sequence numbers */
-    ctx->t1.host_ns ^= 1;
-    ctx->t1.expected_card_ns = t1_i_ns(pcb);
-
-    /* Send R-block acknowledgment if needed */
-    uint8_t r_block[4];
-    size_t r_len = ccid_build_t1_r_block(r_block, ctx->t1.host_ns);
-    if (r_len > 0) {
-        uint8_t r_cmd[SMARTCARD_SEC1210_CCID_MSG_MIN_LEN + 4];
-        build_xfr_block(r_cmd, 0, ctx->seq++, r_block, r_len);
-        /* Fire-and-forget acknowledgment */
-        sec1210_uart_write(r_cmd, SMARTCARD_SEC1210_CCID_MSG_MIN_LEN + r_len);
-    }
-
-    /* Extract APDU data from T=1 INF field (skip NAD+PCB+LEN+LRC) */
-    const uint8_t *apdu_data = t1_block + 3;
-    size_t apdu_data_len = inf_len;
-
-    if (response && apdu_data_len <= response_cap) {
-        memcpy(response, apdu_data, apdu_data_len);
-    }
-    if (response_len) *response_len = apdu_data_len;
-
-    /* SW is last 2 bytes */
-    if (sw && apdu_data_len >= 2) {
-        *sw = (apdu_data[apdu_data_len - 2] << 8) | apdu_data[apdu_data_len - 1];
-    }
-
+    if (response_len)
+        *response_len = out_len;
+    if (sw)
+        *sw = ((uint16_t)response[out_len - 2] << 8) | response[out_len - 1];
     return ESP_OK;
 }
 
@@ -837,8 +908,8 @@ esp_err_t smartcard_sec1210_start(void) {
 
     /* Force the RX pad input-only. Routing a UART RX signal through the GPIO
      * matrix does not disable the pad's output driver, so this is a defensive
-     * guard against the receive pin ever being shared with an output (as the
-     * console pins GPIO37/38 are) and colliding with the reader. */
+     * guard against the receive pin ever being shared with an output and
+     * colliding with the reader. */
     err = gpio_set_direction((gpio_num_t)rx_pin, GPIO_MODE_INPUT);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Could not force RX pad input-only: %s",
@@ -897,35 +968,62 @@ esp_err_t smartcard_sec1210_probe(uint32_t timeout_ms) {
     snprintf(ctx->report.detail, sizeof(ctx->report.detail), "%s",
              "Probing SEC1210...");
 
-    /* Step 1: Power on the card */
-    ESP_LOGI(TAG, "Powering on card...");
-    size_t cmd_len = build_power_on(buf, 0, ctx->seq++, 0x00); /* auto voltage */
-    err = sec1210_send_receive(ctx, buf, cmd_len, resp, sizeof(resp), &resp_len);
-
-    if (err != ESP_OK) {
-        /* Try reading for card presence notification first */
-        vTaskDelay(pdMS_TO_TICKS(100));
-        uint8_t dummy;
-        while (ESP_OK == sec1210_uart_read_byte(&dummy, 100)) {
-            if (dummy == SMARTCARD_SEC1210_RDR_TO_PC_NOTIFY_SLOT_CHANGE) {
-                uint8_t status;
-                sec1210_uart_read_byte(&status, 500);
-                ctx->report.card_present = (status == SMARTCARD_SEC1210_CARD_PRESENT);
-            }
-        }
-
-        if (!ctx->report.card_present) {
-            /* Try power on again */
-            cmd_len = build_power_on(buf, 0, ctx->seq++, 0x00);
-            err = sec1210_send_receive(ctx, buf, cmd_len, resp, sizeof(resp), &resp_len);
-        }
-
+    /* Step 1: Power on the card at 5V, then 3V and 1.8V. The SEC1210 lacks
+     * the auto-voltage and auto-activation features, so bVoltage=0x00 (auto)
+     * fails with HW_ERROR; Linux CmdPowerOn also starts at 5V for it. The
+     * reply's bStatus/bError say why there is no ATR, so log them. */
+    static const uint8_t k_voltages[] = {0x01, 0x02, 0x03};
+    uint8_t status = 0, error = 0;
+    bool have_reply = false;
+    size_t cmd_len;
+    err = ESP_ERR_TIMEOUT;
+    uart_flush_input(CONFIG_KSIG_SEC1210_UART_NUM);
+    for (size_t v = 0; v < sizeof(k_voltages); v++) {
+        ESP_LOGI(TAG, "Powering on card (bVoltage=0x%02X)...", k_voltages[v]);
+        cmd_len = build_power_on(buf, 0, ctx->seq++, k_voltages[v]);
+        err = sec1210_send_receive(ctx, buf, cmd_len, resp, sizeof(resp), &resp_len);
         if (err != ESP_OK) {
+            ESP_LOGW(TAG, "PowerOn: no reply (%s)", esp_err_to_name(err));
+            continue;
+        }
+        sec1210_log_frame("PowerOn reply", resp, resp_len);
+        if (!parse_ccid_status(resp, resp_len, &status, &error)) {
+            ESP_LOGW(TAG, "PowerOn: unexpected message type 0x%02X", resp[0]);
+            err = ESP_ERR_INVALID_RESPONSE;
+            continue;
+        }
+        have_reply = true;
+        ESP_LOGI(TAG, "PowerOn: bStatus=0x%02X (ICC %s, command %s) bError=0x%02X (%s)",
+                 status, ccid_icc_status_name(status),
+                 (status & 0x40U) ? "failed" : "ok", error,
+                 ccid_error_name(error));
+        if ((status & 0x40U) == 0)
+            break; /* ATR received */
+        if ((status & 0x03U) == 0x02U)
+            break; /* no card in the slot: another voltage will not help */
+    }
+
+    if (!have_reply) {
+        ctx->report.state = SMARTCARD_SEC1210_STATE_TIMEOUT;
+        snprintf(ctx->report.detail, sizeof(ctx->report.detail),
+                 "Reader did not answer PowerOn (%s).", esp_err_to_name(err));
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (status & 0x40U) {
+        if ((status & 0x03U) == 0x02U) {
+            ctx->report.card_present = false;
             ctx->report.state = SMARTCARD_SEC1210_STATE_WAITING;
-            snprintf(ctx->report.detail, sizeof(ctx->report.detail), "%s",
-                     "Waiting for smart card insertion.");
+            snprintf(ctx->report.detail, sizeof(ctx->report.detail),
+                     "Reader reports no card in slot (bStatus=0x%02X).", status);
             return ESP_ERR_TIMEOUT;
         }
+        ctx->report.card_present = true;
+        ctx->report.state = SMARTCARD_SEC1210_STATE_FAIL;
+        snprintf(ctx->report.detail, sizeof(ctx->report.detail),
+                 "No ATR: %s (bStatus=0x%02X bError=0x%02X).",
+                 ccid_error_name(error), status, error);
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
     /* Extract ATR */
@@ -940,6 +1038,8 @@ esp_err_t smartcard_sec1210_probe(uint32_t timeout_ms) {
 
     ctx->card_powered = true;
     ctx->report.card_present = true;
+    ctx->t1.host_ns = 0;
+    ctx->t1.expected_card_ns = 0;
     ctx->report.atr_len = atr_len;
     ESP_LOGI(TAG, "ATR received (%lu bytes):", (unsigned long)atr_len);
     for (size_t i = 0; i < atr_len && i < 16; i++) {
@@ -951,7 +1051,8 @@ esp_err_t smartcard_sec1210_probe(uint32_t timeout_ms) {
     parse_atr_t_params(ctx, ctx->report.atr, atr_len);
 
     /* Set CCID descriptor from Linux ccid_serial.c SEC1210 config:
-     * dwFeatures = 0x000100B2 (TPDU + Short APDU + Auto-clock + Auto-voltage)
+     * dwFeatures = 0x000100B2 (TPDU level, auto PPS, auto clock/baud, ATR
+     * parameter config; no auto voltage, no short APDU level)
      * dwDefaultClock = 4800 Hz
      * dwMaxDataRate = 826000 bps */
     ctx->dw_features = 0x000100B2U;
@@ -971,8 +1072,11 @@ esp_err_t smartcard_sec1210_probe(uint32_t timeout_ms) {
         cmd_len = build_set_parameters(ctx, buf, 0, ctx->seq++);
         err = sec1210_send_receive(ctx, buf, cmd_len, resp, sizeof(resp), &resp_len);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "SetParameters failed, falling back to TPDU");
-            ctx->tpdu_exchange = true;
+            ESP_LOGW(TAG, "SetParameters: no reply (%s)", esp_err_to_name(err));
+        } else if (parse_ccid_status(resp, resp_len, &status, &error) &&
+                   (status & 0x40U)) {
+            ESP_LOGW(TAG, "SetParameters failed: bStatus=0x%02X bError=0x%02X (%s)",
+                     status, error, ccid_error_name(error));
         }
     }
 
@@ -992,7 +1096,7 @@ esp_err_t smartcard_sec1210_probe(uint32_t timeout_ms) {
         size_t tx_resp_len = 0;
         uint16_t tx_sw = 0;
 
-        if (ctx->tpdu_exchange || !ctx->atr_t1_present) {
+        if (!ctx->atr_t1_present) {
             err = transmit_apdu_tpdu(ctx, apdu, apdu_len, resp, sizeof(resp),
                                       &tx_resp_len, &tx_sw);
         } else {
@@ -1017,7 +1121,7 @@ esp_err_t smartcard_sec1210_probe(uint32_t timeout_ms) {
         size_t tx_resp_len = 0;
         uint16_t tx_sw = 0;
 
-        if (ctx->tpdu_exchange || !ctx->atr_t1_present) {
+        if (!ctx->atr_t1_present) {
             err = transmit_apdu_tpdu(ctx, k_get_status_apdu, sizeof(k_get_status_apdu),
                                       resp, sizeof(resp), &tx_resp_len, &tx_sw);
         } else {
@@ -1061,7 +1165,7 @@ esp_err_t smartcard_sec1210_transmit_apdu(const uint8_t *apdu, size_t apdu_len,
     ctx->apdu_resp_len = 0;
     ctx->apdu_sw = 0;
 
-    if (ctx->tpdu_exchange || !ctx->atr_t1_present) {
+    if (!ctx->atr_t1_present) {
         err = transmit_apdu_tpdu(ctx, apdu, apdu_len, response, response_cap,
                                   response_len, sw);
     } else {
